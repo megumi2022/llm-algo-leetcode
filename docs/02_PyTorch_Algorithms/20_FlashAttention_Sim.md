@@ -1,4 +1,5 @@
 # 20. FlashAttention Sim | FlashAttention 模拟
+
 **难度：** Hard | **环境：** CPU-first | **标签：** `推理优化`, `Attention`, `FlashAttention` | **目标人群：** 推理优化学习者
 
 > 🚀 **云端运行环境**
@@ -6,8 +7,7 @@
 > 本章节的实战代码可以点击以下链接在免费 GPU 算力平台上直接运行：
 >
 > [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/datawhalechina/llm-algo-leetcode/blob/main/02_PyTorch_Algorithms/20_FlashAttention_Sim.ipynb)
-> [![Open In Studio](https://img.shields.io/badge/Open%20In-ModelScope-blueviolet?logo=alibabacloud)](https://modelscope.cn/my/mynotebook) *(国内推荐：魔搭社区免费实例)*
-
+> [![Open In Studio](<https://img.shields.io/badge/Open%20In-ModelScope-blueviolet?logo=alibabacloud>)](https://modelscope.cn/my/mynotebook) *(国内推荐：魔搭社区免费实例)*
 
 ---
 
@@ -25,6 +25,7 @@
 ## 前置阅读
 
 **导语：** 先能解释 Attention 的工作集和 GPU 内存层级，再观察分块计算如何减少中间 Score 的存储。
+
 - [P1: 03. GPU Architecture and Memory | GPU 物理架构与内存层级](../01_Hardware_Math_and_Systems/03_GPU_Architecture_and_Memory.md)
 - [P1: 14. FlashAttention Memory Model | FlashAttention 显存模型](../01_Hardware_Math_and_Systems/14_FlashAttention_Memory_Model.md)
 - [P1: 24. SRAM Optimization Techniques | SRAM 优化技术](../01_Hardware_Math_and_Systems/24_SRAM_Optimization_Techniques.md)
@@ -37,51 +38,52 @@
 
 先观察完整 Score 与单个 tile 的区别；图中左侧先交代完整 Score 和 GPU 存储访问，中间聚焦本节要实现的分块与 Online Softmax，右侧的版本演进只作为扩展阅读。下一步再解释分块后的状态如何保持结果一致。
 
-| 阶段 | 标准 Attention | 分块路径 |
-|---|---|---|
-| Score | 先得到完整 `QKᵀ` | 只计算当前 `Q block × K block` |
-| Softmax | 对完整行统一计算 | 用 `m / l` 逐块更新 |
-| 输出 | 最后与完整概率矩阵相乘 | 逐块累加 `V block` 的贡献 |
-| 工作集 | 完整 Score 需要长期处理较大的中间区域 | 单个 tile 限制当前暂存区域 |
+| 阶段    | 标准 Attention                        | 分块路径                         |
+| ------- | ------------------------------------- | -------------------------------- |
+| Score   | 先得到完整`QKᵀ`                    | 只计算当前`Q block × K block` |
+| Softmax | 对完整行统一计算                      | 用`m / l` 逐块更新             |
+| 输出    | 最后与完整概率矩阵相乘                | 逐块累加`V block` 的贡献       |
+| 工作集  | 完整 Score 需要长期处理较大的中间区域 | 单个 tile 限制当前暂存区域       |
 
 ![FlashAttention 分块图](../public/02_PyTorch_Algorithms/20_flashattention_tiling.svg)
+
 ### Step 2: Online Softmax 如何保持数值等价
+
 分块以后不能简单地对每个 tile 单独 Softmax，再把结果相加，因为每个 Q 行的归一化分母跨越所有 K block。算法为每个 Q 行保留三项状态：当前最大值 `m`、以该最大值为基准的指数和 `l`、以及已经累积的部分输出 `O`。每轮更新后，这三项状态都代表已经处理过的全部 K block。
 当新的 block 有更大的 Score 时，旧状态必须先换到同一个 `m_new` 基准下，再与当前块相加；表格中的三项状态分别对应最大值、归一化分母和加权输出的重新标定。这样最后的输出才有机会与标准 Attention 对齐。
 
-| 状态 | 作用 | 新 K/V block 到来时发生什么 |
-|---|---|---|
-| `m_i` | 已处理 score 的最大值 | 与 `m_block` 比较，得到 `m_new` |
-| `l_i` | 旧状态的归一化分母 | 按 `exp(m_i - m_new)` 修正后再加当前块 |
-| `O_i` | 旧块贡献的加权输出 | 按旧分母占比缩放，再加入当前块贡献 |
+| 状态    | 作用                  | 新 K/V block 到来时发生什么             |
+| ------- | --------------------- | --------------------------------------- |
+| `m_i` | 已处理 score 的最大值 | 与`m_block` 比较，得到 `m_new`      |
+| `l_i` | 旧状态的归一化分母    | 按`exp(m_i - m_new)` 修正后再加当前块 |
+| `O_i` | 旧块贡献的加权输出    | 按旧分母占比缩放，再加入当前块贡献      |
 
 ![Online Softmax 状态更新图](../public/02_PyTorch_Algorithms/20_online_softmax_state.svg)
+
 ### Step 3: 一个 Q 分块如何吸收全部 K/V 分块
+
 Step 2 的状态更新需要按固定的计算顺序推进：先固定一个 Q 分块，再让它依次接收所有 K/V 分块的信息。每接收一个 K/V 分块，就把局部结果并入同一组 `m / l / O`；直到所有 K/V 分块处理完，这个 Q 分块才得到最终输出。这里关注状态的生命周期，不展开实现所用的循环变量。
 
-| 计算阶段 | 保持不变的对象 | 状态变化 |
-|---|---|---|
-| 开始处理一个 Q 分块 | 当前 Q 分块 | 建立对应的 `m / l / O` 初始状态 |
-| 接收一个 K/V 分块 | 当前 Q 分块与历史状态 | 产生当前分数块，并按 Step 2 合并状态 |
-| 接收完全部 K/V 分块 | 当前 Q 分块 | 得到包含完整上下文信息的 Attention 输出 |
-
+| 计算阶段            | 保持不变的对象        | 状态变化                                |
+| ------------------- | --------------------- | --------------------------------------- |
+| 开始处理一个 Q 分块 | 当前 Q 分块           | 建立对应的`m / l / O` 初始状态        |
+| 接收一个 K/V 分块   | 当前 Q 分块与历史状态 | 产生当前分数块，并按 Step 2 合并状态    |
+| 接收完全部 K/V 分块 | 当前 Q 分块           | 得到包含完整上下文信息的 Attention 输出 |
 
 ### Step 4: CPU 实现任务与验证标准
+
 本步把前面的数据流转成可执行任务：输入是形状为 `[seq_len, dim]` 的 Q、K、V，输出是形状相同的 Attention 结果。先完成 CPU 分块函数，再用标准 Attention、causal、dtype 和数值稳定性测试检查实现。完成 CPU 测试后，再由 Step 5 观察固定 workload 下的 GPU backend 延迟、显存和误差。下面的表格先对齐 CPU 实验对象和判断方式。
 
-| 实验对象 | 输入与输出 | 判断方式 | 结果用途 |
-|---|---|---|---|
-| CPU 分块模拟 | 二维 Q/K/V → 同形状输出 | 与标准 Attention 的最大误差 | 检查 `m / l / O` 状态更新 |
-| causal 扩展 | `causal=True` 的二维 Q/K/V | 与带上三角 mask 的标准结果对齐 | 检查未来位置是否被屏蔽 |
-| dtype 与稳定性 | `float64` 和较大 Score 输入 | 输出 dtype 正确且无 NaN/Inf | 检查数值实现边界 |
-
-
+| 实验对象       | 输入与输出                    | 判断方式                       | 结果用途                   |
+| -------------- | ----------------------------- | ------------------------------ | -------------------------- |
+| CPU 分块模拟   | 二维 Q/K/V → 同形状输出      | 与标准 Attention 的最大误差    | 检查`m / l / O` 状态更新 |
+| causal 扩展    | `causal=True` 的二维 Q/K/V  | 与带上三角 mask 的标准结果对齐 | 检查未来位置是否被屏蔽     |
+| dtype 与稳定性 | `float64` 和较大 Score 输入 | 输出 dtype 正确且无 NaN/Inf    | 检查数值实现边界           |
 
 ```python
 import torch
 import math
 ```
-
 
 ```python
 def flash_attention_forward_sim(q, k, v, block_size=2, causal=False):
@@ -112,61 +114,60 @@ def flash_attention_forward_sim(q, k, v, block_size=2, causal=False):
         raise ValueError('block_size 必须为正数')
 
     seq_len, dim = q.shape
-    
+  
     # TODO 1: 初始化输出 O，全局最大值 m，全局指数和 l
     # 提示: out 与 q 同 device、同 dtype，形状为 [seq_len, dim]；m/l 形状为 [seq_len, 1]
     # out = ???；m = ???；l = ???；m 初始为 -inf，l 初始为 0。
     # out = ???
     # m = ???
     # l = ???
-    
+  
     scale = 1.0 / math.sqrt(dim)
-    
+  
     # 外层循环：遍历 Q 的分块
     for i in range(0, seq_len, block_size):
         q_block = q[i:i+block_size] * scale
         m_i = m[i:i+block_size]
         l_i = l[i:i+block_size]
         out_i = out[i:i+block_size]
-        
+      
         # 内层循环：遍历 K, V 的分块
         for j in range(0, seq_len, block_size):
             k_block = k[j:j+block_size]
             v_block = v[j:j+block_size]
-            
+          
             # TODO 2: 计算当前 Q/K block 的缩放 score S_ij
             # S_ij = (Q_i / sqrt(d)) @ K_j.T
             # TODO 2a（可选 causal mask）：若 causal=True，屏蔽 key_pos > query_pos 的 score。
             # 提示：query_pos = arange(i, ...)，key_pos = arange(j, ...)。
-            
+          
             # TODO 3: 计算当前块的局部最大值 m_block，并求出新的全局最大值 m_new
             # m_block = ???；m_new = ???
             # m_new 是新的数值稳定基准；若 m_new 变化，旧 l_i 和 out_i 都必须重标定。
-            
+          
             # TODO 4: 计算尚未归一化的指数权重 exp_scores
             # exp_scores = exp(S_ij - m_new)
-            
+          
             # TODO 5: 计算当前块的局部指数和 l_block，并更新全局指数和 l_new
             # l_block = ???
             # l_new = ???
-            
+          
             # TODO 6: 更新输出 O_i（修正旧状态并累加当前 V block）
             # out_i = ???
-            
+          
             # 更新全局状态
             # m_i = ???
             # l_i = ???
             pass
-        
+      
         # 写回全局变量
         # out[i:i+block_size] = ???
         # m[i:i+block_size] = ???
         # l[i:i+block_size] = ???
-            
+          
     return out
 
 ```
-
 
 ```python
 # 测试你的实现
@@ -262,12 +263,12 @@ test_flash_attention_sim()
 ---
 
 🛑 **STOP HERE** 🛑
-<br><br><br><br><br><br><br><br><br><br>
-> 请先尝试自己完成代码并跑通测试。<br>
+
+> 请先尝试自己完成代码并跑通测试。
 > 如果你正在 Colab 中运行，并且遇到困难没有思路，可以向下滚动查看参考答案。
-<br><br><br><br><br><br><br><br><br><br>
 
 ---
+
 ## 参考代码与解析
 
 ### 代码
@@ -301,26 +302,26 @@ def flash_attention_forward_sim(q, k, v, block_size=2, causal=False):
         raise ValueError('block_size 必须为正数')
 
     seq_len, dim = q.shape
-    
+  
     # TODO 1: 初始化输出 O，全局最大值 m，全局指数和 l
     out = torch.zeros((seq_len, dim), device=q.device, dtype=q.dtype)
     m = torch.full((seq_len, 1), -float('inf'), device=q.device, dtype=q.dtype)
     l = torch.zeros((seq_len, 1), device=q.device, dtype=q.dtype)
-    
+  
     scale = 1.0 / math.sqrt(dim)
-    
+  
     # 外层循环：遍历 Q 的分块
     for i in range(0, seq_len, block_size):
         q_block = q[i:i+block_size] * scale
         m_i = m[i:i+block_size]
         l_i = l[i:i+block_size]
         out_i = out[i:i+block_size]
-        
+      
         # 内层循环：遍历 K, V 的分块
         for j in range(0, seq_len, block_size):
             k_block = k[j:j+block_size]
             v_block = v[j:j+block_size]
-            
+          
             # TODO 2: 计算当前 Q/K block 的缩放 score S_ij
             S_ij = q_block @ k_block.transpose(-2, -1)
             # TODO 2a（可选扩展）：只保留当前位置及之前的 K/V。
@@ -328,70 +329,78 @@ def flash_attention_forward_sim(q, k, v, block_size=2, causal=False):
                 query_pos = torch.arange(i, i + q_block.shape[0], device=q.device)[:, None]
                 key_pos = torch.arange(j, j + k_block.shape[0], device=q.device)[None, :]
                 S_ij = S_ij.masked_fill(key_pos > query_pos, -float('inf'))
-            
+          
             # TODO 3: 计算当前块的局部最大值 m_block，并求出新的全局最大值 m_new
             m_block = torch.max(S_ij, dim=-1, keepdim=True)[0]
             m_new = torch.maximum(m_i, m_block)
-            
+          
             # TODO 4: 计算尚未归一化的指数权重 exp_scores
             exp_scores = torch.exp(S_ij - m_new)
-            
+          
             # TODO 5: 计算当前块的局部指数和 l_block，并更新全局指数和 l_new
             l_block = torch.sum(exp_scores, dim=-1, keepdim=True)
             l_new = l_i * torch.exp(m_i - m_new) + l_block
-            
+          
             # TODO 6: 更新输出 O_i（使用 Online Softmax 的修正公式）
             out_i = out_i * (l_i * torch.exp(m_i - m_new) / l_new) + (exp_scores @ v_block) / l_new
-            
+          
             # 更新全局状态
             m_i = m_new
             l_i = l_new
-        
+      
         # 写回全局变量
         out[i:i+block_size] = out_i
         m[i:i+block_size] = m_i
         l[i:i+block_size] = l_i
-            
+          
     return out
 ```
 
 ### 解析
 
 **1. TODO 1: 初始化全局状态**
+
 - **实现方式**：`out = torch.zeros((seq_len, dim), device=q.device, dtype=q.dtype)`，`m = torch.full((seq_len, 1), -float('inf'), device=q.device, dtype=q.dtype)`，`l = torch.zeros((seq_len, 1), device=q.device, dtype=q.dtype)`
 - **关键点**：m 初始化为负无穷，确保第一个块的最大值能正确更新；l 初始化为 0，用于累加指数和
 - **技术细节**：使用 `keepdim=True` 保持二维列向量形状，便于后续广播运算；这里显式沿用输入 dtype，真实 kernel 可能采用 FP32 累加器。
 
 **2. TODO 2: 计算当前块的缩放 score S_ij**
+
 - **实现方式**：`S_ij = q_block @ k_block.transpose(-2, -1)`
 - **关键点**：这是标准的 Attention Score 计算，但只针对当前的 Q 块和 K 块
 - **技术细节**：q_block 已经在外层循环中乘以了 scale，避免重复缩放
 
 **2a. 可选 causal mask 扩展**
+
 - 对每个 Q/K block 使用全局 token 位置构造 `key_pos > query_pos` 的屏蔽条件。
 - 被屏蔽的 score 设为负无穷，使其指数权重为 0；这不会改变 Online Softmax 的状态更新方式。
 - 该扩展只验证因果约束下的数值一致性，不涉及真实 decoder kernel 的 mask 融合性能。
 
 **3. TODO 3: 计算局部最大值并更新全局最大值**
+
 - **实现方式**：`m_block = torch.max(S_ij, dim=-1, keepdim=True)[0]`，`m_new = torch.maximum(m_i, m_block)`
 - **关键点**：Online Softmax 的核心——动态更新最大值，用于数值稳定性
 - **技术细节**：使用 `torch.maximum` 而非 `torch.max`，因为需要逐元素比较两个张量
 
 **4. TODO 4: 计算尚未归一化的指数权重**
+
 - **实现方式**：`exp_scores = torch.exp(S_ij - m_new)`
 - **关键点**：这里还不是最终概率，后续需要除以 `l_new`；减去 `m_new` 用于数值稳定。
 
 **5. TODO 5: 计算局部指数和并更新全局指数和**
+
 - **实现方式**：`l_block = torch.sum(exp_scores, dim=-1, keepdim=True)`，由于 `exp_scores` 已按 `m_new` 为基准，`l_new = l_i * torch.exp(m_i - m_new) + l_block`
 - **关键点**：Online Softmax 的修正公式——当最大值变化时，需要用指数因子修正旧的指数和
 - **技术细节**：`l_i * torch.exp(m_i - m_new)` 是修正项，将旧的指数和调整到新的基准 `m_new`；若 `l_block` 以 `m_block` 为基准，则还需乘 `exp(m_block - m_new)`。
 
 **6. TODO 6: 更新输出 O_i**
+
 - **实现方式**：`out_i = out_i * (l_i * torch.exp(m_i - m_new) / l_new) + (exp_scores @ v_block) / l_new`
 - **关键点**：同时修正旧输出和累加新输出，确保最终结果等价于标准 Attention
 - **技术细节**：第一项是修正后的旧输出，第二项是当前块的贡献
 
 **工程优化要点**
+
 - **中间工作集**：不再物化完整的 O(N²) Attention Score 矩阵；单个 tile 的临时 score 约为 O(Bq × Bk)，Q/K/V、输出和状态仍需占用存储。
 - **数值稳定性**：通过动态更新最大值 m，确保指数运算不会溢出
 - **分块策略**：block_size 是关键超参数，需要根据硬件的 SRAM 大小调优
@@ -399,23 +408,25 @@ def flash_attention_forward_sim(q, k, v, block_size=2, causal=False):
 - **工业实现**：真实的 FlashAttention 使用 CUDA/Triton 实现，利用共享内存和寄存器优化访存
 
 **进阶思考**
+
 - 如果把未归一化的加权和统一保存到循环结束，再一次性除以最终 `l`，会如何影响实现复杂度和数值稳定性？
 
 ### Step 5: GPU 可选对照实验
 
 完成 Step 4 的 CPU 函数和测试后，再运行本步 GPU 对照。本步只回答一个问题：在相同 Q/K/V workload 下，显式 Attention 与 PyTorch SDPA 的延迟、峰值显存和数值误差有什么差异？
 
-| 实验部分 | 学习者需要做什么 | 输出与证据 |
-|---|---|---|
-| 环境与 workload | 设置 GPU、dtype、batch、head、seq_len、causal、warmup 和 iters | 自动记录 GPU、PyTorch、CUDA 与 workload |
-| 两条执行路径 | 在同一组 Q/K/V 上运行显式 Attention 和 SDPA | 比较两种实现的延迟、峰值显存和最大误差 |
-| 结果与解释 | 将 JSON 结果登记到最后的表格 | 形成当前 GPU 与固定 workload 下的对照结论 |
+| 实验部分        | 学习者需要做什么                                               | 输出与证据                                |
+| --------------- | -------------------------------------------------------------- | ----------------------------------------- |
+| 环境与 workload | 设置 GPU、dtype、batch、head、seq_len、causal、warmup 和 iters | 自动记录 GPU、PyTorch、CUDA 与 workload   |
+| 两条执行路径    | 在同一组 Q/K/V 上运行显式 Attention 和 SDPA                    | 比较两种实现的延迟、峰值显存和最大误差    |
+| 结果与解释      | 将 JSON 结果登记到最后的表格                                   | 形成当前 GPU 与固定 workload 下的对照结论 |
 
 当前环境是消费级 GPU（例如 RTX 4090 D 或 RTX 5070 Ti）。本单元运行的是显式 Attention 与 SDPA，不把 SDPA 结果直接命名为 FlashAttention-2/3/4；如果要验证真实 FlashAttention-2，应另行安装并运行 `flash-attn` backend。FA3/FA4 的专用 kernel 需要对应的数据中心 GPU 与软件环境，本节不据当前实验推断其性能。
 
 环境与配置由后面的代码自动记录，结果表放在 GPU 执行单元之后。
 
 ![GPU Attention 对照实验流程图](../public/02_PyTorch_Algorithms/20_gpu_attention_experiment_flow.svg)
+
 #### GPU 对照实验：配置与执行
 
 先运行配置单元确认 workload，再运行执行单元。默认 `RUN_GPU_EXPERIMENT = False`，因此答案区测试不会启动 GPU；采集数据时只修改配置单元，不直接改执行逻辑。
@@ -438,7 +449,6 @@ GPU_ITERS = 20
 GPU_SEED = 42
 GPU_OUTPUT_RELATIVE_PATH = 'benchmarks/results/20_flashattention_gpu.json'
 ```
-
 
 ```python
 """运行显式 Attention 与 PyTorch SDPA 的固定 workload GPU 对照。"""
@@ -574,12 +584,12 @@ gpu_result = _run_gpu_attention_experiment()
 
 将执行单元输出的 JSON 与配置一起抄录到下表。每次改变序列长度、dtype、causal 或实现后新增一组行，不覆盖已有结果；没有运行或发生 OOM 时保留空值并填写状态。同一组 naive / SDPA 必须使用相同 Q/K/V 形状、dtype、causal、warmup 和迭代次数，`status` 使用 `ok` 或 `OOM`。该表记录固定 workload 的一次对照，不替代重复 benchmark。
 
-| GPU / PyTorch / CUDA | dtype | batch × heads × seq × dim | causal | 实现 | latency (ms) | peak allocated (MB) | peak reserved (MB) | max error | status |
-|---|---|---|---|---|---:|---:|---:|---:|---|
-|  |  |  |  | naive |  |  |  |  |  |
-|  |  |  |  | SDPA |  |  |  |  |  |
-|  |  |  |  | naive |  |  |  |  |  |
-|  |  |  |  | SDPA |  |  |  |  |  |
+| GPU / PyTorch / CUDA | dtype | batch × heads × seq × dim | causal | 实现  | latency (ms) | peak allocated (MB) | peak reserved (MB) | max error | status |
+| -------------------- | ----- | ---------------------------- | ------ | ----- | -----------: | ------------------: | -----------------: | --------: | ------ |
+|                      |       |                              |        | naive |              |                     |                    |           |        |
+|                      |       |                              |        | SDPA  |              |                     |                    |           |        |
+|                      |       |                              |        | naive |              |                     |                    |           |        |
+|                      |       |                              |        | SDPA  |              |                     |                    |           |        |
 
 ## 相关阅读
 
